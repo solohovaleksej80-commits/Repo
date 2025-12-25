@@ -1,277 +1,298 @@
 """
-Telegram Parser Backend для Railway
+Telegram Universal Parser
+Универсальный парсер для Telegram с поддержкой двух методов сканирования
 """
 
-from fastapi import FastAPI, Form, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from telethon import TelegramClient
 from telethon.tl.types import User, Channel, Chat
-from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
+from telethon.errors import ChatAdminRequiredError
 import asyncio
-import io
 import csv
-import json
-import os
+from tqdm import tqdm
 
-app = FastAPI(title="Telegram Parser API")
-
-# CORS для фронтенда
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# API Credentials (из твоих файлов)
+# API настройки
 API_ID = 27844448
 API_HASH = 'e33633be38924a65b804cf1de0ed4da3'
 
-# Хранилище сессий и данных
-sessions = {}
-parsed_data = {}
 
-def get_session_path(phone: str) -> str:
-    """Путь к файлу сессии"""
-    safe_phone = phone.replace("+", "").replace("-", "")
-    return f"sessions/session_{safe_phone}"
-
-@app.get("/")
-async def root():
-    return {"status": "ok", "message": "Telegram Parser API"}
-
-@app.post("/send_code")
-async def send_code(phone: str = Form(...)):
-    """Отправляет код подтверждения"""
-    try:
-        os.makedirs("sessions", exist_ok=True)
-        session_path = get_session_path(phone)
+class UniversalTelegramParser:
+    def __init__(self, api_id, api_hash):
+        self.client = TelegramClient('session_name', api_id, api_hash)
+        self.chats = []
         
-        client = TelegramClient(session_path, API_ID, API_HASH)
-        await client.connect()
+    async def start(self, phone):
+        await self.client.start(phone=phone)
+        print("✅ Авторизация успешна!\n")
         
-        if not await client.is_user_authorized():
-            sent = await client.send_code_request(phone)
-            sessions[phone] = {
-                "client": client,
-                "phone_code_hash": sent.phone_code_hash
+    async def get_all_chats(self):
+        print("📋 Загружаю чаты...\n")
+        self.chats = []
+        
+        async for dialog in self.client.iter_dialogs():
+            chat_info = {
+                'id': dialog.id,
+                'name': dialog.name,
+                'type': self._get_chat_type(dialog.entity),
+                'entity': dialog.entity,
+                'is_group': isinstance(dialog.entity, (Chat, Channel))
             }
-            return {"status": "code_sent"}
-        else:
-            sessions[phone] = {"client": client}
-            return {"status": "already_authorized"}
+            self.chats.append(chat_info)
             
-    except Exception as e:
-        return {"error": str(e)}
-
-@app.post("/confirm_code")
-async def confirm_code(phone: str = Form(...), code: str = Form(...)):
-    """Подтверждает код"""
-    try:
-        if phone not in sessions:
-            raise HTTPException(400, "Сначала запросите код")
-        
-        session = sessions[phone]
-        client = session["client"]
-        
-        if await client.is_user_authorized():
-            return {"status": "success"}
-        
-        await client.sign_in(
-            phone=phone,
-            code=code,
-            phone_code_hash=session.get("phone_code_hash")
-        )
-        return {"status": "success"}
-        
-    except PhoneCodeInvalidError:
-        return {"error": "Неверный код"}
-    except SessionPasswordNeededError:
-        return {"error": "Требуется двухфакторная аутентификация", "need_2fa": True}
-    except Exception as e:
-        return {"error": str(e)}
-
-@app.post("/confirm_2fa")
-async def confirm_2fa(phone: str = Form(...), password: str = Form(...)):
-    """Подтверждает 2FA пароль"""
-    try:
-        if phone not in sessions:
-            raise HTTPException(400, "Сессия не найдена")
-        
-        client = sessions[phone]["client"]
-        await client.sign_in(password=password)
-        return {"status": "success"}
-        
-    except Exception as e:
-        return {"error": str(e)}
-
-@app.post("/get_chats")
-async def get_chats(phone: str = Form(...)):
-    if phone not in sessions:
-        raise HTTPException(status_code=401, detail="Не авторизован")
+        return self.chats
     
-    client = sessions[phone]
-    dialogs = await client.get_dialogs(limit=100)
+    def _get_chat_type(self, entity):
+        if isinstance(entity, User):
+            return "👤 Личный"
+        elif isinstance(entity, Channel):
+            return "📢 Канал" if not entity.megagroup else "👥 Супергруппа"
+        elif isinstance(entity, Chat):
+            return "👥 Группа"
+        return "❓ Неизвестно"
     
-    chats = []
-    for dialog in dialogs:
-        entity = dialog.entity
+    def display_chats(self):
+        print("=" * 70)
+        print("ДОСТУПНЫЕ ЧАТЫ:")
+        print("=" * 70)
         
-        # Определяем название в зависимости от типа
-        if hasattr(entity, 'title'):
-            # Каналы и группы
-            title = entity.title
-        elif hasattr(entity, 'first_name'):
-            # Пользователи
-            name_parts = [entity.first_name or ""]
-            if entity.last_name:
-                name_parts.append(entity.last_name)
-            title = " ".join(name_parts) or entity.username or f"User {entity.id}"
-        else:
-            title = f"Chat {entity.id}"
+        for idx, chat in enumerate(self.chats, 1):
+            print(f"{idx}. {chat['type']} {chat['name']}")
         
-        # Определяем тип
-        if hasattr(entity, 'megagroup') and entity.megagroup:
-            chat_type = "supergroup"
-        elif hasattr(entity, 'broadcast') and entity.broadcast:
-            chat_type = "channel"
-        elif hasattr(entity, 'first_name'):
-            chat_type = "user"
-        else:
-            chat_type = "chat"
-        
-        chats.append({
-            "id": entity.id,
-            "title": title,  # Теперь реальное название
-            "type": chat_type,
-            "members_count": getattr(entity, 'participants_count', None)
-        })
+        print("=" * 70 + "\n")
     
-    return {"chats": chats}
-
+    async def parse_by_messages(self, chat_entity):
+        """Парсинг по сообщениям"""
+        print("\n🔍 Метод 1: Парсинг по сообщениям")
         
-    except Exception as e:
-        return {"error": str(e)}
-
-@app.post("/parse_chat")
-async def parse_chat(
-    phone: str = Form(...),
-    chat_id: int = Form(...),
-    method: str = Form("messages"),  # messages, members, all
-    limit: int = Form(None)
-):
-    """Парсит участников чата"""
-    try:
-        if phone not in sessions:
-            raise HTTPException(400, "Сначала авторизуйтесь")
+        users_dict = {}
         
-        client = sessions[phone]["client"]
-        entity = await client.get_entity(chat_id)
+        try:
+            # Подсчитываем общее количество сообщений
+            total = await self.client.get_messages(chat_entity, limit=0)
+            total_count = total.total if hasattr(total, 'total') else 10000
+            
+            with tqdm(total=total_count, desc="Парсинг сообщений", unit="msg") as pbar:
+                async for message in self.client.iter_messages(chat_entity, limit=None):
+                    if message.sender:
+                        user_id = message.sender_id
+                        
+                        if user_id not in users_dict:
+                            try:
+                                sender = await message.get_sender()
+                                if isinstance(sender, User):
+                                    full_name = f"{sender.first_name or ''} {sender.last_name or ''}".strip()
+                                    users_dict[user_id] = {
+                                        'name': full_name or 'Нет имени',
+                                        'username': f"@{sender.username}" if sender.username else '',
+                                        'phone': sender.phone or ''
+                                    }
+                            except:
+                                pass
+                    
+                    pbar.update(1)
+            
+            return list(users_dict.values())
+            
+        except Exception as e:
+            print(f"❌ Ошибка парсинга по сообщениям: {e}")
+            return []
+    
+    async def parse_by_members(self, chat_entity):
+        """Парсинг по участникам"""
+        print("\n🔍 Метод 2: Парсинг по участникам")
         
-        users = {}
+        users_list = []
         
-        # Парсинг по сообщениям
-        if method in ["messages", "all"]:
-            async for message in client.iter_messages(entity, limit=limit):
-                if message.sender and isinstance(message.sender, User):
-                    user = message.sender
-                    if user.id not in users and not user.bot:
-                        users[user.id] = {
-                            "id": user.id,
-                            "first_name": user.first_name or "",
-                            "last_name": user.last_name or "",
-                            "username": f"@{user.username}" if user.username else "",
-                            "phone": user.phone or "",
-                            "source": "messages"
-                        }
+        try:
+            participants = await self.client.get_participants(chat_entity)
+            
+            with tqdm(total=len(participants), desc="Парсинг участников", unit="user") as pbar:
+                for user in participants:
+                    if isinstance(user, User):
+                        full_name = f"{user.first_name or ''} {user.last_name or ''}".strip()
+                        users_list.append({
+                            'name': full_name or 'Нет имени',
+                            'username': f"@{user.username}" if user.username else '',
+                            'phone': user.phone or ''
+                        })
+                    pbar.update(1)
+            
+            return users_list
+            
+        except ChatAdminRequiredError:
+            print("⚠️  Нужны права администратора для получения списка участников")
+            return []
+        except Exception as e:
+            print(f"❌ Ошибка парсинга по участникам: {e}")
+            return []
+    
+    async def parse_both(self, chat_entity):
+        """Парсинг обоими методами"""
+        print("\n🔍 Метод 3: Парсинг обоими способами")
+        
+        users_dict = {}
         
         # Парсинг по участникам
-        if method in ["members", "all"]:
-            try:
-                async for user in client.iter_participants(entity):
-                    if isinstance(user, User) and not user.bot:
-                        if user.id not in users:
-                            users[user.id] = {
-                                "id": user.id,
-                                "first_name": user.first_name or "",
-                                "last_name": user.last_name or "",
-                                "username": f"@{user.username}" if user.username else "",
-                                "phone": user.phone or "",
-                                "source": "members"
-                            }
-                        elif method == "all":
-                            users[user.id]["source"] = "both"
-            except Exception as e:
-                if method == "members":
-                    return {"error": f"Не удалось получить участников: {str(e)}"}
-        
-        result = list(users.values())
-        parsed_data[phone] = result
-        
-        return {
-            "status": "success",
-            "count": len(result),
-            "users": result[:50]  # Первые 50 для превью
-        }
-        
-    except Exception as e:
-        return {"error": str(e)}
-
-@app.get("/download/{phone}")
-async def download(phone: str, format: str = "txt"):
-    """Скачивает результаты парсинга"""
-    if phone not in parsed_data:
-        raise HTTPException(404, "Данные не найдены")
-    
-    users = parsed_data[phone]
-    
-    if format == "txt":
-        content = ""
-        for user in users:
-            line = f"{user['first_name']} {user['last_name']}".strip()
-            if user['username']:
-                line += f" | {user['username']}"
-            line += f" | ID: {user['id']}"
-            if user['phone']:
-                line += f" | Tel: {user['phone']}"
-            content += line + "\n"
-        
-        return StreamingResponse(
-            io.BytesIO(content.encode('utf-8')),
-            media_type="text/plain",
-            headers={"Content-Disposition": "attachment; filename=users.txt"}
-        )
-    
-    elif format == "csv":
-        output = io.StringIO()
-        writer = csv.DictWriter(output, fieldnames=["id", "first_name", "last_name", "username", "phone", "source"])
-        writer.writeheader()
-        writer.writerows(users)
-        
-        return StreamingResponse(
-            io.BytesIO(output.getvalue().encode('utf-8')),
-            media_type="text/csv",
-            headers={"Content-Disposition": "attachment; filename=users.csv"}
-        )
-    
-    elif format == "json":
-        return StreamingResponse(
-            io.BytesIO(json.dumps(users, ensure_ascii=False, indent=2).encode('utf-8')),
-            media_type="application/json",
-            headers={"Content-Disposition": "attachment; filename=users.json"}
-        )
-
-@app.post("/logout")
-async def logout(phone: str = Form(...)):
-    """Выход из аккаунта"""
-    if phone in sessions:
         try:
-            await sessions[phone]["client"].disconnect()
+            participants = await self.client.get_participants(chat_entity)
+            
+            with tqdm(total=len(participants), desc="[1/2] Участники", unit="user") as pbar:
+                for user in participants:
+                    if isinstance(user, User):
+                        full_name = f"{user.first_name or ''} {user.last_name or ''}".strip()
+                        users_dict[user.id] = {
+                            'name': full_name or 'Нет имени',
+                            'username': f"@{user.username}" if user.username else '',
+                            'phone': user.phone or ''
+                        }
+                    pbar.update(1)
         except:
-            pass
-        del sessions[phone]
-    if phone in parsed_data:
-        del parsed_data[phone]
-    return {"status": "logged_out"}
+            print("⚠️  Не удалось получить список участников, пропускаем...")
+        
+        # Парсинг по сообщениям
+        try:
+            total = await self.client.get_messages(chat_entity, limit=0)
+            total_count = total.total if hasattr(total, 'total') else 10000
+            
+            with tqdm(total=total_count, desc="[2/2] Сообщения", unit="msg") as pbar:
+                async for message in self.client.iter_messages(chat_entity, limit=None):
+                    if message.sender:
+                        user_id = message.sender_id
+                        
+                        if user_id not in users_dict:
+                            try:
+                                sender = await message.get_sender()
+                                if isinstance(sender, User):
+                                    full_name = f"{sender.first_name or ''} {sender.last_name or ''}".strip()
+                                    users_dict[user_id] = {
+                                        'name': full_name or 'Нет имени',
+                                        'username': f"@{sender.username}" if sender.username else '',
+                                        'phone': sender.phone or ''
+                                    }
+                            except:
+                                pass
+                    
+                    pbar.update(1)
+        except Exception as e:
+            print(f"⚠️  Ошибка при парсинге сообщений: {e}")
+        
+        return list(users_dict.values())
+    
+    def save_csv(self, data, filename="telegram_users.csv"):
+        """Сохранение в CSV"""
+        try:
+            with open(filename, 'w', encoding='utf-8-sig', newline='') as f:
+                if data:
+                    writer = csv.DictWriter(f, fieldnames=['name', 'username', 'phone'])
+                    writer.writeheader()
+                    writer.writerows(data)
+            print(f"✅ CSV сохранён: {filename}")
+        except Exception as e:
+            print(f"❌ Ошибка сохранения CSV: {e}")
+    
+    def save_txt(self, data, filename="telegram_users.txt"):
+        """Сохранение в TXT"""
+        try:
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write("=" * 80 + "\n")
+                f.write("РЕЗУЛЬТАТЫ ПАРСИНГА TELEGRAM\n")
+                f.write("=" * 80 + "\n\n")
+                
+                for idx, user in enumerate(data, 1):
+                    f.write(f"#{idx}\n")
+                    f.write(f"Имя: {user['name']}\n")
+                    if user['username']:
+                        f.write(f"Username: {user['username']}\n")
+                    if user['phone']:
+                        f.write(f"Телефон: {user['phone']}\n")
+                    f.write("\n" + "-" * 80 + "\n\n")
+            
+            print(f"✅ TXT сохранён: {filename}")
+        except Exception as e:
+            print(f"❌ Ошибка сохранения TXT: {e}")
+    
+    async def close(self):
+        await self.client.disconnect()
+
+
+async def main():
+    print("=" * 70)
+    print(" " * 20 + "TELEGRAM UNIVERSAL PARSER")
+    print("=" * 70 + "\n")
+    
+    phone_number = input("📱 Введите номер телефона (+79001234567): ")
+    print()
+    
+    parser = UniversalTelegramParser(API_ID, API_HASH)
+    
+    try:
+        await parser.start(phone_number)
+        await parser.get_all_chats()
+        
+        while True:
+            parser.display_chats()
+            
+            choice = input("Введите номер чата (или 'q' для выхода): ")
+            
+            if choice.lower() == 'q':
+                break
+            
+            try:
+                chat_index = int(choice) - 1
+                
+                if chat_index < 0 or chat_index >= len(parser.chats):
+                    print("❌ Неверный номер!\n")
+                    continue
+                
+                selected_chat = parser.chats[chat_index]
+                print(f"\n📋 Выбран чат: {selected_chat['name']}")
+                
+                print("\n" + "=" * 70)
+                print("ВЫБЕРИТЕ МЕТОД ПАРСИНГА:")
+                print("=" * 70)
+                print("1. По сообщениям (кто писал)")
+                print("2. По участникам (все члены чата)")
+                print("3. Оба метода (максимальный охват)")
+                print("=" * 70)
+                
+                method = input("\nВыберите метод (1/2/3): ")
+                
+                users_data = []
+                
+                if method == '1':
+                    users_data = await parser.parse_by_messages(selected_chat['entity'])
+                elif method == '2':
+                    users_data = await parser.parse_by_members(selected_chat['entity'])
+                elif method == '3':
+                    users_data = await parser.parse_both(selected_chat['entity'])
+                else:
+                    print("❌ Неверный выбор!\n")
+                    continue
+                
+                if users_data:
+                    print(f"\n✅ Найдено пользователей: {len(users_data)}")
+                    
+                    parser.save_csv(users_data, "telegram_users.csv")
+                    parser.save_txt(users_data, "telegram_users.txt")
+                    print()
+                else:
+                    print("⚠️  Пользователи не найдены\n")
+                
+                cont = input("Парсить другой чат? (y/n): ")
+                if cont.lower() != 'y':
+                    break
+                
+                print()
+                    
+            except ValueError:
+                print("❌ Введите корректный номер!\n")
+            except KeyboardInterrupt:
+                print("\n\n⚠️  Прервано")
+                break
+        
+    finally:
+        await parser.close()
+        print("\n👋 Работа завершена!")
+
+
+if __name__ == '__main__':
+    asyncio.run(main())
