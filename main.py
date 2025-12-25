@@ -45,6 +45,10 @@ class ParseRequest(BaseModel):
     chat_id: int
     method: str  # "messages", "members", "both"
 
+class TwoFARequest(BaseModel):
+    phone: str
+    password: str
+
 
 # Эндпоинты
 @app.post("/send_code")
@@ -86,6 +90,21 @@ async def verify_code(request: CodeRequest):
         raise HTTPException(status_code=400, detail="Неверный код")
     except SessionPasswordNeededError:
         raise HTTPException(status_code=400, detail="Требуется 2FA пароль")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/verify_2fa")
+async def verify_2fa(request: TwoFARequest):
+    """Проверка 2FA пароля"""
+    try:
+        if request.phone not in sessions:
+            raise HTTPException(status_code=400, detail="Сначала запросите код")
+        
+        client = sessions[request.phone]['client']
+        await client.sign_in(password=request.password)
+        
+        return {"success": True, "message": "Авторизация успешна"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
