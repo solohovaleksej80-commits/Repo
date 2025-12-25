@@ -109,40 +109,48 @@ async def confirm_2fa(phone: str = Form(...), password: str = Form(...)):
 
 @app.post("/get_chats")
 async def get_chats(phone: str = Form(...)):
-    """Получает список чатов пользователя"""
-    try:
-        if phone not in sessions:
-            raise HTTPException(400, "Сначала авторизуйтесь")
+    if phone not in sessions:
+        raise HTTPException(status_code=401, detail="Не авторизован")
+    
+    client = sessions[phone]
+    dialogs = await client.get_dialogs(limit=100)
+    
+    chats = []
+    for dialog in dialogs:
+        entity = dialog.entity
         
-        client = sessions[phone]["client"]
-        chats = []
+        # Определяем название в зависимости от типа
+        if hasattr(entity, 'title'):
+            # Каналы и группы
+            title = entity.title
+        elif hasattr(entity, 'first_name'):
+            # Пользователи
+            name_parts = [entity.first_name or ""]
+            if entity.last_name:
+                name_parts.append(entity.last_name)
+            title = " ".join(name_parts) or entity.username or f"User {entity.id}"
+        else:
+            title = f"Chat {entity.id}"
         
-        async for dialog in client.iter_dialogs():
-            chat_type = "unknown"
-            is_group = False
-            
-            if isinstance(dialog.entity, User):
-                chat_type = "user"
-            elif isinstance(dialog.entity, Channel):
-                if dialog.entity.megagroup:
-                    chat_type = "supergroup"
-                    is_group = True
-                else:
-                    chat_type = "channel"
-                    is_group = True
-            elif isinstance(dialog.entity, Chat):
-                chat_type = "group"
-                is_group = True
-            
-            chats.append({
-                "id": dialog.id,
-                "name": dialog.name,
-                "type": chat_type,
-                "is_group": is_group,
-                "unread": dialog.unread_count
-            })
+        # Определяем тип
+        if hasattr(entity, 'megagroup') and entity.megagroup:
+            chat_type = "supergroup"
+        elif hasattr(entity, 'broadcast') and entity.broadcast:
+            chat_type = "channel"
+        elif hasattr(entity, 'first_name'):
+            chat_type = "user"
+        else:
+            chat_type = "chat"
         
-        return {"chats": chats}
+        chats.append({
+            "id": entity.id,
+            "title": title,  # Теперь реальное название
+            "type": chat_type,
+            "members_count": getattr(entity, 'participants_count', None)
+        })
+    
+    return {"chats": chats}
+
         
     except Exception as e:
         return {"error": str(e)}
